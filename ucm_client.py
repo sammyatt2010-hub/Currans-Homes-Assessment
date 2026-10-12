@@ -60,7 +60,7 @@ class UCMConfig:
     def from_secrets(cls, d) -> "UCMConfig":
         d = dict(d)
         return cls(host=str(d["host"]).strip().replace("https://", "").replace("http://", "").rstrip("/"),
-                   user=str(d["user"]), password=str(d["password"]), port=int(d.get("port", 8089)),
+                   user=str(d["user"]).strip(), password=str(d["password"]), port=int(d.get("port", 8089)),
                    legacy_port=int(d.get("legacy_port", 8443)), scheme=str(d.get("scheme", "https")),
                    mode=str(d.get("mode", "auto")), verify_ssl=bool(d.get("verify_ssl", False)),
                    timeout=int(d.get("timeout", 30)))
@@ -80,6 +80,8 @@ class UCMClient:
         self.cfg = cfg
         self.s = requests.Session()
         self.s.verify = cfg.verify_ssl
+        # match Grandstream's documented example request exactly
+        self.s.headers.update({"Content-Type": "application/json;charset=UTF-8", "Connection": "close"})
         if not cfg.verify_ssl:
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
         self.cookie: str | None = None
@@ -107,7 +109,7 @@ class UCMClient:
     def _post(self, payload: dict, base: str | None = None) -> dict:
         url = f"{base or self.base or self._candidates()[0]}/api"
         try:
-            r = self.s.post(url, json={"request": payload}, timeout=self.cfg.timeout)
+            r = self.s.post(url, data=json.dumps({"request": payload}), timeout=self.cfg.timeout)
         except requests.exceptions.SSLError as e:
             raise UCMError(f"{url}: secure connection failed (SSLError) - this port probably isn't the HTTPS web "
                            f"portal port.") from e
@@ -137,7 +139,27 @@ class UCMClient:
 
     def login(self) -> str:
         ch = self._find_base()
+        tried = ["1.0"]
+        for version in (None, "1.2", "2.0"):
+            if ch.get("status") != -1:
+                break
+            # "invalid parameters" - newer firmware (e.g. GCC6000 series) may want another API version;
+            # the field is optional, so also try without it
+            self.log.append(f"challenge (version {tried[-1]}) rejected: {_snippet(json.dumps(ch), 200)}")
+            req = {"action": "challenge", "user": self.cfg.user}
+            if version:
+                req["version"] = version
+            tried.append(version or "none")
+            ch = self._post(req)
+        if ch.get("status") == 0 and len(tried) > 1:
+            self.log.append(f"challenge accepted with version {tried[-1]}")
         if ch.get("status") != 0:
+            self.last_reply = json.dumps(ch)
+            if ch.get("status") == -1:
+                raise UCMError(f"the phone system answered 'invalid parameters' to the login challenge for API user "
+                               f"'{self.cfg.user}' (tried API versions {', '.join(tried)}; last reply "
+                               f"{_snippet(json.dumps(ch), 200)}). Check the username exactly matches the API user "
+                               f"(it's case-sensitive, letters and numbers only) and that the HTTPS API is enabled.")
             raise UCMError(_status_msg("challenge", ch.get("status")))
         challenge = ch["response"]["challenge"]
         token = hashlib.md5(f"{challenge}{self.cfg.password}".encode()).hexdigest()
@@ -158,7 +180,7 @@ class UCMClient:
             self.cookie = None
 
     def _api_page(self, start: str, end: str, offset: int) -> list:
-        if not self.cookie or time.time() - self.cookie_at > 8 * 60:  # cookies last 10 minutes
+        if not self.cookie or time.time() - self.cookie_at > 4 * 60:  # sessions expire after 5 idle minutes
             self.login()
         payload = {"action": "cdrapi", "cookie": self.cookie, "format": "json", "startTime": start,
                    "endTime": end, "numRecords": str(PAGE), "offset": str(offset)}
