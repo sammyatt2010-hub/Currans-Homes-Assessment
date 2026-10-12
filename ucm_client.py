@@ -83,29 +83,60 @@ class UCMClient:
         if not cfg.verify_ssl:
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
         self.cookie: str | None = None
+        self.base: str | None = None   # the scheme://host:port that answered
         self.cookie_at = 0.0
         self.log: list[str] = []
 
     # ---------------------------------------------------------------- HTTPS API
     @property
     def api_url(self) -> str:
-        return f"{self.cfg.scheme}://{self.cfg.host}:{self.cfg.port}/api"
+        return f"{self.base or self._candidates()[0]}/api"
 
-    def _post(self, payload: dict) -> dict:
+    def _candidates(self) -> list[str]:
+        """Where the HTTPS API might live: the configured port first, then the usual UCM web ports.
+        (The API is served on the same port as the UCM's web portal.)"""
+        out = []
+        for scheme, port in [(self.cfg.scheme, self.cfg.port), ("https", 443), ("https", 8089)]:
+            if port == 80:
+                scheme = "http"
+            b = f"{scheme}://{self.cfg.host}" + ("" if (scheme, port) in (("https", 443), ("http", 80)) else f":{port}")
+            if b not in out:
+                out.append(b)
+        return out
+
+    def _post(self, payload: dict, base: str | None = None) -> dict:
+        url = f"{base or self.base or self._candidates()[0]}/api"
         try:
-            r = self.s.post(self.api_url, json={"request": payload}, timeout=self.cfg.timeout)
+            r = self.s.post(url, json={"request": payload}, timeout=self.cfg.timeout)
+        except requests.exceptions.SSLError as e:
+            raise UCMError(f"{url}: secure connection failed (SSLError) - this port probably isn't the HTTPS web "
+                           f"portal port.") from e
         except requests.RequestException as e:
-            raise UCMError(f"Couldn't reach the phone system at {self.api_url} ({e.__class__.__name__}).") from e
+            raise UCMError(f"{url}: no answer ({e.__class__.__name__}) - port closed or not forwarded.") from e
         if r.status_code != 200:
-            raise UCMError(f"Phone system replied HTTP {r.status_code} on {payload.get('action')}.")
+            raise UCMError(f"{url}: replied HTTP {r.status_code} on {payload.get('action')}.")
         try:
             data = r.json()
         except ValueError as e:
-            raise UCMError(f"Unexpected reply to {payload.get('action')} (not JSON).") from e
+            raise UCMError(f"{url}: reply to {payload.get('action')} wasn't JSON (starts: "
+                           f"{_snippet(r.text)}) - is the HTTPS API enabled?") from e
         return data
 
+    def _find_base(self) -> str:
+        """Try each candidate address until one answers the challenge request."""
+        errors = []
+        for base in ([self.base] if self.base else self._candidates()):
+            try:
+                ch = self._post({"action": "challenge", "user": self.cfg.user, "version": "1.0"}, base)
+                self.base = base
+                self.log.append(f"HTTPS API found at {base}/api")
+                return ch
+            except UCMError as e:
+                errors.append(str(e))
+        raise UCMError(" / ".join(errors))
+
     def login(self) -> str:
-        ch = self._post({"action": "challenge", "user": self.cfg.user, "version": "1.0"})
+        ch = self._find_base()
         if ch.get("status") != 0:
             raise UCMError(_status_msg("challenge", ch.get("status")))
         challenge = ch["response"]["challenge"]
@@ -157,7 +188,7 @@ class UCMClient:
         try:
             return _find_root(r.json())
         except ValueError as e:
-            raise UCMError("Legacy CDR API reply was not JSON.") from e
+            raise UCMError(f"Legacy CDR API reply wasn't JSON (starts: {_snippet(r.text)}).") from e
 
     # ---------------------------------------------------------------- public
     def fetch(self, start: datetime, end: datetime) -> FetchResult:
@@ -193,7 +224,7 @@ class UCMClient:
         if self.cfg.mode in ("auto", "https_api"):
             try:
                 self.login()
-                steps.append(("HTTPS API login", True, f"Logged in as '{self.cfg.user}'"))
+                steps.append(("HTTPS API login", True, f"Logged in as '{self.cfg.user}' at {self.base}/api"))
                 page = self._api_page(now.replace(hour=0, minute=0, second=0).strftime("%Y-%m-%dT%H:%M:%S"),
                                       now.strftime("%Y-%m-%dT%H:%M:%S"), 0)
                 steps.append(("Read today's call records", True, f"{len(page)} calls so far today"))
@@ -216,6 +247,11 @@ class UCMClient:
 # --------------------------------------------------------------------------- #
 STATUS = {-1: "invalid parameters", -5: "authentication required", -6: "session expired or missing cookie",
           -7: "connection closed", -8: "timed out", -15: "invalid value", -37: "wrong username or password"}
+
+
+def _snippet(text: str, n: int = 80) -> str:
+    t = " ".join(str(text).split())
+    return f'"{t[:n]}{"..." if len(t) > n else ""}"' if t else "empty"
 
 
 def _status_msg(action: str, status) -> str:
