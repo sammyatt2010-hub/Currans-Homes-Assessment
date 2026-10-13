@@ -27,6 +27,7 @@ import requests
 import urllib3
 
 PAGE = 1000  # the UCM's maximum records per request
+_LEARNED: dict = {}  # (host, user) -> {"version": ..., "hash": ...} that worked, kept while the app runs
 
 # UCM API field -> CSV export column
 FIELD_MAP = {
@@ -54,6 +55,7 @@ class UCMConfig:
     scheme: str = "https"
     mode: str = "auto"            # "auto", "https_api" or "legacy"
     verify_ssl: bool = False      # UCMs usually use a self-signed certificate
+    token_hash: str = "auto"      # auto | md5 | sha256
     timeout: int = 30
 
     @classmethod
@@ -63,7 +65,7 @@ class UCMConfig:
                    user=str(d["user"]).strip(), password=str(d["password"]), port=int(d.get("port", 8089)),
                    legacy_port=int(d.get("legacy_port", 8443)), scheme=str(d.get("scheme", "https")),
                    mode=str(d.get("mode", "auto")), verify_ssl=bool(d.get("verify_ssl", False)),
-                   timeout=int(d.get("timeout", 30)))
+                   timeout=int(d.get("timeout", 30)), token_hash=str(d.get("token_hash", "auto")))
 
 
 @dataclass
@@ -85,6 +87,10 @@ class UCMClient:
         if not cfg.verify_ssl:
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
         self.cookie: str | None = None
+        learned = _LEARNED.get((cfg.host, cfg.user), {})
+        self._version = learned.get("version", None)  # API version the phone system accepted
+        self._hash = learned.get("hash")
+        self.details: dict = {}
         self.base: str | None = None   # the scheme://host:port that answered
         self.cookie_at = 0.0
         self.log: list[str] = []
@@ -137,39 +143,73 @@ class UCMClient:
                 errors.append(str(e))
         raise UCMError(" / ".join(errors))
 
+    def _challenge(self, version):
+        req = {"action": "challenge", "user": self.cfg.user}
+        if version:
+            req["version"] = version
+        return self._post(req)
+
     def login(self) -> str:
-        ch = self._find_base()
+        # 1) challenge - newer firmware (e.g. GCC6000 series) may reject version 1.0; the field is optional
+        if self._version is not None and self.base is None:
+            self._find_base()  # locate the API address (the reply to this probe isn't used)
+            ch = self._challenge(self._version)
+        else:
+            ch = self._find_base()
         tried = ["1.0"]
-        for version in (None, "1.2", "2.0"):
-            if ch.get("status") != -1:
+        version = "1.0" if self._version is None else self._version
+        for v in (None, "1.2", "2.0"):
+            if ch.get("status") != -1 or self._version is not None:
                 break
-            # "invalid parameters" - newer firmware (e.g. GCC6000 series) may want another API version;
-            # the field is optional, so also try without it
             self.log.append(f"challenge (version {tried[-1]}) rejected: {_snippet(json.dumps(ch), 200)}")
-            req = {"action": "challenge", "user": self.cfg.user}
-            if version:
-                req["version"] = version
-            tried.append(version or "none")
-            ch = self._post(req)
-        if ch.get("status") == 0 and len(tried) > 1:
-            self.log.append(f"challenge accepted with version {tried[-1]}")
+            tried.append(v or "none")
+            version = v
+            ch = self._challenge(v)
         if ch.get("status") != 0:
-            self.last_reply = json.dumps(ch)
             if ch.get("status") == -1:
                 raise UCMError(f"the phone system answered 'invalid parameters' to the login challenge for API user "
                                f"'{self.cfg.user}' (tried API versions {', '.join(tried)}; last reply "
                                f"{_snippet(json.dumps(ch), 200)}). Check the username exactly matches the API user "
                                f"(it's case-sensitive, letters and numbers only) and that the HTTPS API is enabled.")
             raise UCMError(_status_msg("challenge", ch.get("status")))
-        challenge = ch["response"]["challenge"]
-        token = hashlib.md5(f"{challenge}{self.cfg.password}".encode()).hexdigest()
-        lg = self._post({"action": "login", "user": self.cfg.user, "token": token})
-        if lg.get("status") != 0:
-            raise UCMError(_status_msg("login", lg.get("status")))
-        self.cookie = lg["response"]["cookie"]
-        self.cookie_at = time.time()
-        self.log.append("Logged in to the HTTPS API.")
-        return self.cookie
+        self._version = version
+
+        # 2) login - token is md5(challenge + password); some newer firmware may use sha256.
+        #    At most two attempts, so the address isn't locked out for repeated failures.
+        if self.cfg.token_hash in ("md5", "sha256"):
+            hashes = [self.cfg.token_hash]
+        elif self._hash:
+            hashes = [self._hash]
+        else:
+            hashes = ["md5", "sha256"]
+        last = None
+        for i, h in enumerate(hashes):
+            if i:  # every login needs a fresh challenge
+                ch = self._challenge(version)
+                if ch.get("status") != 0:
+                    break
+            challenge = ch["response"]["challenge"]
+            fn = hashlib.md5 if h == "md5" else hashlib.sha256
+            token = fn(f"{challenge}{self.cfg.password}".encode()).hexdigest()
+            lg = self._post({"action": "login", "user": self.cfg.user, "token": token})
+            last = lg
+            if lg.get("status") == 0:
+                self.cookie = lg["response"]["cookie"]
+                self.cookie_at = time.time()
+                self.details = {"version": version or "none", "hash": h, "base": self.base}
+                self._hash = h
+                _LEARNED[(self.cfg.host, self.cfg.user)] = {"version": version, "hash": h}
+                self.log.append(f"Logged in to the HTTPS API (API version {version or 'none'}, {h} token).")
+                return self.cookie
+            self.log.append(f"login with {h} token refused: {_snippet(json.dumps(lg), 200)}")
+        status = (last or {}).get("status")
+        msg = _status_msg("login", status)
+        if status == -37:
+            msg = (f"login failed: the phone system says the username or password is wrong for API user "
+                   f"'{self.cfg.user}' (challenge accepted with API version {version or 'none'}; tried "
+                   f"{' and '.join(hashes)} tokens). Re-type the API user's password in Secrets (wrap it in single "
+                   f"quotes if it contains \\ or \"), or reset it on the phone system to letters and numbers only.")
+        raise UCMError(msg)
 
     def logout(self):
         if self.cookie:
@@ -246,7 +286,9 @@ class UCMClient:
         if self.cfg.mode in ("auto", "https_api"):
             try:
                 self.login()
-                steps.append(("HTTPS API login", True, f"Logged in as '{self.cfg.user}' at {self.base}/api"))
+                steps.append(("HTTPS API login", True,
+                              f"Logged in as '{self.cfg.user}' at {self.base}/api (API version "
+                              f"{self.details.get('version')}, {self.details.get('hash')} token)"))
                 page = self._api_page(now.replace(hour=0, minute=0, second=0).strftime("%Y-%m-%dT%H:%M:%S"),
                                       now.strftime("%Y-%m-%dT%H:%M:%S"), 0)
                 steps.append(("Read today's call records", True, f"{len(page)} calls so far today"))
@@ -254,6 +296,8 @@ class UCMClient:
                 return steps
             except UCMError as e:
                 steps.append(("HTTPS API", False, str(e)))
+                if self.log:
+                    steps.append(("What the phone system said", False, " · ".join(self.log[-4:])))
         if self.cfg.mode in ("auto", "legacy"):
             try:
                 page = self._legacy_page(now.replace(hour=0, minute=0, second=0).strftime("%Y-%m-%dT%H:%M:%S"),
