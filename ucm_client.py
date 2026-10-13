@@ -26,9 +26,19 @@ import pandas as pd
 import requests
 import urllib3
 
-CLIENT_VERSION = "2026-10-13"  # shown in errors and the connection test, to confirm which file is deployed
+CLIENT_VERSION = "2026-10-13b"  # shown in errors and the connection test, to confirm which file is deployed
 PAGE = 1000  # the UCM's maximum records per request
 _LEARNED: dict = {}  # (host, user) -> {"version": ..., "hash": ...} that worked, kept while the app runs
+_HOLD: dict = {}     # (host, user) -> (until_epoch, reason): don't send logins until then
+FAIL_BACKOFF = 15 * 60  # after a refused login, wait this long before the portal tries again by itself
+
+
+def _hold_msg(key) -> str | None:
+    until, reason = _HOLD.get(key, (0, ""))
+    left = until - time.time()
+    if left <= 0:
+        return None
+    return f"{reason} The portal won't try again for {int(left // 60) + 1} min, to avoid locking the account."
 
 # UCM API field -> CSV export column
 FIELD_MAP = {
@@ -150,7 +160,11 @@ class UCMClient:
             req["version"] = version
         return self._post(req)
 
-    def login(self) -> str:
+    def login(self, force: bool = False) -> str:
+        key = (self.cfg.host, self.cfg.user)
+        held = _hold_msg(key)
+        if held and (not force or _HOLD[key][1].startswith("The phone system has locked")):
+            raise UCMError(held)
         # 1) challenge - newer firmware (e.g. GCC6000 series) may reject version 1.0; the field is optional
         if self._version is not None and self.base is None:
             self._find_base()  # locate the API address (the reply to this probe isn't used)
@@ -203,8 +217,17 @@ class UCMClient:
                 self.log.append(f"Logged in to the HTTPS API (API version {version or 'none'}, {h} token).")
                 return self.cookie
             self.log.append(f"login with {h} token refused: {_snippet(json.dumps(lg), 200)}")
+            if lg.get("status") != -37:
+                break  # locked out or another error - never keep trying
         status = (last or {}).get("status")
         msg = _status_msg("login", status)
+        if status == -68:
+            remain = int(((last or {}).get("response") or {}).get("remain_time") or 900)
+            _HOLD[key] = (time.time() + remain + 30,
+                          "The phone system has locked API logins after too many failed attempts.")
+            raise UCMError(_hold_msg(key) + " Please don't press refresh or test until then.")
+        if status == -37:
+            _HOLD[key] = (time.time() + FAIL_BACKOFF, "The last login was refused (wrong username or password).")
         if status == -37:
             msg = (f"login failed: the phone system says the username or password is wrong for API user "
                    f"'{self.cfg.user}' (challenge accepted with API version {version or 'none'}; tried "
@@ -319,8 +342,11 @@ class UCMClient:
         return rows
 
     def try_login_variants(self) -> list[tuple[str, bool, str]]:
-        """Up to 4 alternative login formats (each failure can count towards a lock-out)."""
+        """Two alternative login formats (each failure can count towards a lock-out)."""
         rows = []
+        held = _hold_msg((self.cfg.host, self.cfg.user))
+        if held and _HOLD[(self.cfg.host, self.cfg.user)][1].startswith("The phone system has locked"):
+            return [("Locked", False, held)]
         try:
             self._find_base()
         except UCMError as e:
@@ -328,10 +354,7 @@ class UCMClient:
         variants = [
             ("md5(challenge+password) + url field", lambda c: hashlib.md5(f"{c}{self.cfg.password}".encode()).hexdigest(),
              {"url": f"{self.base}"}),
-            ("MD5 in capitals", lambda c: hashlib.md5(f"{c}{self.cfg.password}".encode()).hexdigest().upper(), {}),
             ("md5(password+challenge)", lambda c: hashlib.md5(f"{self.cfg.password}{c}".encode()).hexdigest(), {}),
-            ("md5 + version 1.0 on login", lambda c: hashlib.md5(f"{c}{self.cfg.password}".encode()).hexdigest(),
-             {"version": "1.0"}),
         ]
         for label, tok, extra in variants:
             ch = self._challenge(self._version if self._version is not None else None)
@@ -342,6 +365,13 @@ class UCMClient:
             lg = self._post(payload)
             ok = lg.get("status") == 0
             rows.append((label, ok, _snippet(json.dumps(lg), 140)))
+            if lg.get("status") == -68:
+                remain = int((lg.get("response") or {}).get("remain_time") or 900)
+                _HOLD[(self.cfg.host, self.cfg.user)] = (time.time() + remain + 30,
+                                                          "The phone system has locked API logins after too many "
+                                                          "failed attempts.")
+                rows.append(("Locked", False, f"Stopped - locked for about {remain // 60 + 1} min."))
+                return rows
             if ok:
                 self.cookie = lg["response"]["cookie"]
                 self.logout()
@@ -357,7 +387,7 @@ class UCMClient:
         now = now or datetime.now()
         if self.cfg.mode in ("auto", "https_api"):
             try:
-                self.login()
+                self.login(force=True)
                 steps.append(("HTTPS API login", True,
                               f"Logged in as '{self.cfg.user}' at {self.base}/api (API version "
                               f"{self.details.get('version')}, {self.details.get('hash')} token)"))
@@ -383,7 +413,7 @@ class UCMClient:
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
-STATUS = {-1: "invalid parameters", -5: "authentication required", -6: "session expired or missing cookie",
+STATUS = {-68: "logins temporarily locked after too many failed attempts", -1: "invalid parameters", -5: "authentication required", -6: "session expired or missing cookie",
           -7: "connection closed", -8: "timed out", -15: "invalid value", -37: "wrong username or password"}
 
 
