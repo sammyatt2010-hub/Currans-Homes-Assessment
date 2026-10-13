@@ -26,6 +26,7 @@ import pandas as pd
 import requests
 import urllib3
 
+CLIENT_VERSION = "2026-10-13"  # shown in errors and the connection test, to confirm which file is deployed
 PAGE = 1000  # the UCM's maximum records per request
 _LEARNED: dict = {}  # (host, user) -> {"version": ..., "hash": ...} that worked, kept while the app runs
 
@@ -277,11 +278,11 @@ class UCMClient:
             except UCMError as e:
                 errors.append(f"{'HTTPS API' if method == 'https_api' else 'Legacy CDR API'}: {e}")
                 self.log.append(str(e))
-        raise UCMError(" | ".join(errors))
+        raise UCMError(" | ".join(errors) + f" [client {CLIENT_VERSION}]")
 
     def test(self, now: datetime | None = None) -> list[tuple[str, bool, str]]:
         """Step-by-step connection check for the admin panel (now = the UCM's local time)."""
-        steps = []
+        steps = [("Connector version", True, f"ucm_client.py {CLIENT_VERSION}")]
         now = now or datetime.now()
         if self.cfg.mode in ("auto", "https_api"):
             try:
