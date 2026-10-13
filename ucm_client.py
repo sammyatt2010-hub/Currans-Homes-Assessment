@@ -280,6 +280,77 @@ class UCMClient:
                 self.log.append(str(e))
         raise UCMError(" | ".join(errors) + f" [client {CLIENT_VERSION}]")
 
+    def diagnose(self) -> list[tuple[str, bool, str]]:
+        """Challenge-only probes (no login attempts, so nothing counts towards a lock-out).
+        Shows whether the phone system recognises the API username at all."""
+        rows = [("Connector version", True, f"ucm_client.py {CLIENT_VERSION}")]
+        try:
+            self._find_base()
+        except UCMError as e:
+            return rows + [("Reach the API", False, str(e))]
+        rows.append(("Reach the API", True, f"{self.base}/api answered"))
+        probes = [("Your API user, version 1.0", self.cfg.user, "1.0"),
+                  ("Your API user, no version", self.cfg.user, None),
+                  ("Made-up user 'zz9notauser', version 1.0", "zz9notauser", "1.0"),
+                  ("Made-up user 'zz9notauser', no version", "zz9notauser", None)]
+        for label, user, ver in probes:
+            req = {"action": "challenge", "user": user}
+            if ver:
+                req["version"] = ver
+            try:
+                rep = self._post(req)
+                rows.append((label, rep.get("status") == 0, _snippet(json.dumps(rep), 160)))
+            except UCMError as e:
+                rows.append((label, False, str(e)))
+        r = {lbl: ok for lbl, ok, _ in rows}
+        real1, fake1 = r.get(probes[0][0]), r.get(probes[2][0])
+        real0, fake0 = r.get(probes[1][0]), r.get(probes[3][0])
+        if real1:
+            verdict = "The API username is recognised with version 1.0."
+        elif fake0 and real0 and not fake1:
+            verdict = ("Version 1.0 is refused for any user and the no-version challenge is given to anyone, so this "
+                       "can't confirm the username - the password check is where it fails.")
+        elif real0 and fake0:
+            verdict = ("The phone system hands out a challenge to any username, so a wrong username and a wrong "
+                       "password look the same here. Double-check both on the API user.")
+        else:
+            verdict = "Unusual pattern - please send these results to SY Communications."
+        rows.append(("What this means", True, verdict))
+        return rows
+
+    def try_login_variants(self) -> list[tuple[str, bool, str]]:
+        """Up to 4 alternative login formats (each failure can count towards a lock-out)."""
+        rows = []
+        try:
+            self._find_base()
+        except UCMError as e:
+            return [("Reach the API", False, str(e))]
+        variants = [
+            ("md5(challenge+password) + url field", lambda c: hashlib.md5(f"{c}{self.cfg.password}".encode()).hexdigest(),
+             {"url": f"{self.base}"}),
+            ("MD5 in capitals", lambda c: hashlib.md5(f"{c}{self.cfg.password}".encode()).hexdigest().upper(), {}),
+            ("md5(password+challenge)", lambda c: hashlib.md5(f"{self.cfg.password}{c}".encode()).hexdigest(), {}),
+            ("md5 + version 1.0 on login", lambda c: hashlib.md5(f"{c}{self.cfg.password}".encode()).hexdigest(),
+             {"version": "1.0"}),
+        ]
+        for label, tok, extra in variants:
+            ch = self._challenge(self._version if self._version is not None else None)
+            if ch.get("status") != 0:
+                rows.append((label, False, f"challenge refused: {_snippet(json.dumps(ch), 120)}"))
+                continue
+            payload = {"action": "login", "user": self.cfg.user, "token": tok(ch["response"]["challenge"]), **extra}
+            lg = self._post(payload)
+            ok = lg.get("status") == 0
+            rows.append((label, ok, _snippet(json.dumps(lg), 140)))
+            if ok:
+                self.cookie = lg["response"]["cookie"]
+                self.logout()
+                rows.append(("Result", True, f"This format works - tell SY Communications: '{label}'."))
+                return rows
+        rows.append(("Result", False, "None of the alternative formats were accepted, so the username/password "
+                                      "on the phone system most likely don't match Secrets."))
+        return rows
+
     def test(self, now: datetime | None = None) -> list[tuple[str, bool, str]]:
         """Step-by-step connection check for the admin panel (now = the UCM's local time)."""
         steps = [("Connector version", True, f"ucm_client.py {CLIENT_VERSION}")]
