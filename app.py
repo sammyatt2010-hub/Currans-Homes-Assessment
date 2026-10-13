@@ -233,11 +233,25 @@ if is_admin:
         cfg_view = {k: ("•••••••" if k == "password" else v) for k, v in UCM_CFG.items()}
         st.caption("Settings come from the app's Secrets (the [ucm] section).")
         st.json(cfg_view, expanded=False)
-        if st.button("Run connection test"):
+        b1, b2, b3 = st.columns(3)
+        steps = None
+        if b1.button("Run connection test", **FULL_WIDTH):
             try:
                 steps = UCMClient(UCMConfig.from_secrets(UCM_CFG)).test(now_local())
             except Exception as e:  # noqa: BLE001
                 steps = [("Configuration", False, f"{e.__class__.__name__}: {e}")]
+        if b2.button("Deep check (no login attempts)", **FULL_WIDTH):
+            try:
+                steps = UCMClient(UCMConfig.from_secrets(UCM_CFG)).diagnose()
+            except Exception as e:  # noqa: BLE001
+                steps = [("Configuration", False, f"{e.__class__.__name__}: {e}")]
+        if b3.button("Try other login formats (4 attempts)", **FULL_WIDTH,
+                     help="Each failed attempt can count towards the phone system's lock-out - use sparingly."):
+            try:
+                steps = UCMClient(UCMConfig.from_secrets(UCM_CFG)).try_login_variants()
+            except Exception as e:  # noqa: BLE001
+                steps = [("Configuration", False, f"{e.__class__.__name__}: {e}")]
+        if steps:
             render_html("".join(f'<div class="pe-step-row"><span class="{"ok" if ok else "no"}">'
                                 f'{"✓" if ok else "✕"}</span><div><b>{esc(name)}</b><br>'
                                 f'<span style="color:var(--muted)">{esc(msg)}</span></div></div>'
